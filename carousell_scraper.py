@@ -284,6 +284,152 @@ def _dom_listings(page: Page, host: str) -> List[Product]:
 
 
 # ---------------------------------------------------------------------------
+# API pagination replay - the reliable path.
+# ---------------------------------------------------------------------------
+
+def _bump_pagination(url: str, step: int) -> Optional[str]:
+    """
+    Given a Carousell listings-API URL, produce the next page URL by
+    bumping whichever pagination param is present. Returns None if the
+    URL doesn't look like a paginated listings endpoint.
+    """
+    from urllib.parse import urlparse as _up, parse_qsl, urlencode, urlunparse
+
+    parsed = _up(url)
+    qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    # Common cursor/offset params used by Carousell's various endpoints.
+    if "offset" in qs:
+        try:
+            qs["offset"] = str(int(qs["offset"]) + step)
+        except ValueError:
+            return None
+    elif "start" in qs:
+        try:
+            qs["start"] = str(int(qs["start"]) + step)
+        except ValueError:
+            return None
+    elif "page" in qs:
+        try:
+            qs["page"] = str(int(qs["page"]) + 1)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    return urlunparse(parsed._replace(query=urlencode(qs)))
+
+
+def _count_listings_in_json(data: Any) -> int:
+    """Count how many listing-like objects are in a JSON blob."""
+    count = 0
+
+    def walk(n: Any) -> None:
+        nonlocal count
+        if isinstance(n, dict):
+            if _looks_like_listing(n):
+                count += 1
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+
+    walk(data)
+    return count
+
+
+def _replay_pagination(
+    page: Page,
+    host: str,
+    seen_urls: List[str],
+    seen_bodies: Dict[str, str],
+    collected: Dict[str, Product],
+    page_size: int = 30,
+    max_pages: int = 500,
+) -> None:
+    """
+    Find the pagination URL from the captured network traffic and replay
+    it with bumped offsets until the API returns no more listings.
+
+    This is the PRIMARY path to loading every listing, zero scrolling
+    required. We pick the URL that returned the most listings (that's
+    the main seller feed endpoint), then page through it directly.
+    """
+    # Rank captured URLs by how many listings they returned.
+    scored = []
+    for url in seen_urls:
+        body = seen_bodies.get(url)
+        if not body:
+            continue
+        try:
+            data = json.loads(body)
+        except Exception:
+            continue
+        n = _count_listings_in_json(data)
+        if n >= 3 and _bump_pagination(url, page_size) is not None:
+            scored.append((n, url))
+
+    if not scored:
+        print(
+            "[!] Could not detect a paginated listings API from captured traffic. "
+            "Falling back to whatever was already loaded.",
+            file=sys.stderr,
+        )
+        return
+
+    scored.sort(reverse=True)
+    best_url = scored[0][1]
+    print(
+        f"[+] Using API endpoint {best_url.split('?')[0]} for pagination",
+        file=sys.stderr,
+    )
+
+    # Replay via the browser's request context so cookies/headers carry over.
+    ctx = page.context
+    url = best_url
+    empty_in_a_row = 0
+
+    for i in range(max_pages):
+        next_url = _bump_pagination(url, page_size)
+        if not next_url:
+            break
+        try:
+            resp = ctx.request.get(next_url, timeout=20_000)
+        except Exception as e:
+            print(f"[!] Request failed: {e}", file=sys.stderr)
+            break
+        if resp.status != 200:
+            print(
+                f"[!] API returned HTTP {resp.status}, stopping pagination.",
+                file=sys.stderr,
+            )
+            break
+        try:
+            data = resp.json()
+        except Exception:
+            break
+
+        before = len(collected)
+        _walk_for_listings(data, host, collected)
+        gained = len(collected) - before
+        print(
+            f"[api] page {i + 2}: +{gained} new (total: {len(collected)})",
+            file=sys.stderr,
+        )
+
+        if gained == 0:
+            empty_in_a_row += 1
+            # Two empty pages in a row = we've reached the end.
+            if empty_in_a_row >= 2:
+                break
+        else:
+            empty_in_a_row = 0
+
+        url = next_url
+
+
+# ---------------------------------------------------------------------------
 # Scrolling - just keep nudging the page to trigger API fetches.
 # ---------------------------------------------------------------------------
 
@@ -420,6 +566,8 @@ def _scroll_hard(page: Page, rounds: int = 80, pause_ms: int = 1200) -> None:
 def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
     host = urlparse(profile_url).hostname or "www.carousell.com"
     collected: Dict[str, Product] = {}  # link -> Product
+    seen_urls: List[str] = []           # order-preserving list of Carousell JSON URLs
+    seen_bodies: Dict[str, str] = {}    # url -> response body text
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
@@ -435,6 +583,8 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
         page = context.new_page()
 
         # Intercept every JSON-ish response and mine it for listings.
+        # We also remember the response body so we can later detect the
+        # pagination endpoint and replay it directly.
         def on_response(resp: Response) -> None:
             try:
                 ct = (resp.headers.get("content-type") or "").lower()
@@ -450,6 +600,9 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
                 data = json.loads(body_text)
             except Exception:
                 return
+            if url not in seen_bodies:
+                seen_urls.append(url)
+                seen_bodies[url] = body_text
             before = len(collected)
             _walk_for_listings(data, host, collected)
             gained = len(collected) - before
@@ -495,8 +648,28 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
         except Exception:
             pass
 
-        print("[+] Scrolling to trigger API pagination...", file=sys.stderr)
-        _scroll_hard(page)
+        # Give the initial page a moment to fire its first API calls.
+        page.wait_for_timeout(2000)
+
+        # PRIMARY PATH: detect Carousell's listings-feed endpoint from the
+        # traffic we've seen and page through it directly. Zero scrolling
+        # required - this is a plain HTTP fetch loop.
+        print(
+            "[+] Replaying Carousell's pagination API directly "
+            "(no scrolling needed)...",
+            file=sys.stderr,
+        )
+        _replay_pagination(page, host, seen_urls, seen_bodies, collected)
+
+        # BACKUP PATH: if the API replay didn't work on this layout for some
+        # reason, fall back to scroll-and-capture.
+        if len(collected) < 30:
+            print(
+                "[+] API replay returned < 30 listings; falling back to "
+                "scroll-capture as a backup.",
+                file=sys.stderr,
+            )
+            _scroll_hard(page)
 
         # Final DOM scrape as a backup / enrichment pass.
         dom_products = _dom_listings(page, host)
