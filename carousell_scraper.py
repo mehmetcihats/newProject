@@ -92,6 +92,9 @@ def extract_products(page: Page) -> List[Product]:
     token is the price, and the first meaningful non-price line is the title.
     """
     # Grab a de-duplicated list of (href, innerText) tuples from the DOM.
+    # We walk up from each listing anchor to its card container so we can also
+    # detect "Sold" / "Reserved" badges, which are sibling elements rather
+    # than part of the anchor's own innerText.
     raw = page.evaluate(
         """
         () => {
@@ -101,28 +104,57 @@ def extract_products(page: Page) -> List[Product]:
                 const href = a.getAttribute('href') || '';
                 // Only listing-detail URLs look like /p/<slug>-<digits>
                 if (!/\\/p\\/[^/]+-\\d+/.test(href)) return;
+
                 const text = (a.innerText || '').trim();
                 if (!text) return;
-                // Keep the longer text version if duplicate href appears.
+
+                // Walk up a few levels to find the whole product card so we
+                // can inspect its full text for Sold/Reserved overlays.
+                let card = a;
+                for (let i = 0; i < 4 && card.parentElement; i++) {
+                    card = card.parentElement;
+                }
+                const cardText = (card.innerText || '').trim();
+
                 const prev = seen.get(href);
-                if (!prev || text.length > prev.length) seen.set(href, text);
+                const candidate = { text, cardText };
+                if (!prev || text.length > prev.text.length) {
+                    seen.set(href, candidate);
+                }
             });
-            return Array.from(seen, ([href, text]) => ({ href, text }));
+            return Array.from(seen, ([href, v]) => ({
+                href, text: v.text, cardText: v.cardText,
+            }));
         }
         """
     )
 
     products: List[Product] = []
     seen_links: Set[str] = set()
+    skipped_sold = 0
+
+    # Status words that mean a listing is NOT available for sale.
+    UNAVAILABLE_STATUSES = ("sold", "reserved", "pending")
 
     for item in raw:
         href: str = item["href"]
         text: str = item["text"]
+        card_text: str = item.get("cardText", "") or text
 
         link = href if href.startswith("http") else f"{BASE}{href}"
         if link in seen_links:
             continue
         seen_links.add(link)
+
+        # Skip any listing whose card has a Sold / Reserved / Pending badge.
+        # We check word-boundaries so we don't filter titles that legitimately
+        # contain the substring (e.g. "Solid oak table").
+        lowered = card_text.lower()
+        if any(
+            re.search(rf"\b{status}\b", lowered) for status in UNAVAILABLE_STATUSES
+        ):
+            skipped_sold += 1
+            continue
 
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         price = ""
@@ -134,7 +166,7 @@ def extract_products(page: Page) -> List[Product]:
             elif not title and not PRICE_RE.search(ln):
                 # First non-price line is the title.
                 # Skip obvious non-title boilerplate.
-                if ln.lower() in {"protection", "carousell protection", "mailing", "meetup"}:
+                if ln.lower() in {"protection", "carousell protection", "mailing", "meetup", "bumped"}:
                     continue
                 title = ln
 
@@ -147,6 +179,11 @@ def extract_products(page: Page) -> List[Product]:
 
         products.append(Product(title=title, price=price, link=link))
 
+    if skipped_sold:
+        print(
+            f"[i] Skipped {skipped_sold} sold/reserved listing(s).",
+            file=sys.stderr,
+        )
     return products
 
 
