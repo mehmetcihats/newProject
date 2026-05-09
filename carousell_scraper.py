@@ -302,22 +302,39 @@ def _count_listing_anchors(page: Page) -> int:
     )
 
 
-def _scroll_hard(page: Page, rounds: int = 60, pause_ms: int = 1500) -> None:
+def _scroll_hard(page: Page, rounds: int = 80, pause_ms: int = 1200) -> None:
     """
-    Scroll aggressively to trigger every lazy-loader the page might have.
-    Progress is printed each round so the user can see what's happening.
+    Trigger Carousell's lazy-loader fully automatically.
+
+    The reliable technique: grab the LAST product card currently in the DOM
+    and call `scrollIntoView()` on it. This makes the element visible no
+    matter what kind of virtualized / overflow container holds it, which is
+    exactly what Carousell's IntersectionObserver needs to fetch the next
+    page of listings. Window / container / wheel scrolls don't always
+    reach the right scroll context on the Indonesian profile layout, which
+    is why the older version stalled at 20 and required manual scrolling.
     """
     last = -1
     stable = 0
     for i in range(rounds):
-        # 1. nudge up
-        page.evaluate("() => window.scrollBy(0, -400)")
-        page.wait_for_timeout(120)
-
-        # 2. scroll window + every scrollable descendant to the bottom
+        # 1. The main trick: scroll the last visible product card into view.
+        #    This forces the browser to realize "this element should be
+        #    on screen", which cascades through every scroll container and
+        #    triggers the intersection observer that loads the next batch.
         page.evaluate(
             """
             () => {
+                const anchors = document.querySelectorAll('a[href*="/p/"]');
+                let last = null;
+                for (const a of anchors) {
+                    const h = a.getAttribute('href') || '';
+                    if (/\\/p\\/[^/]+-\\d+/.test(h)) last = a;
+                }
+                if (last) {
+                    last.scrollIntoView({ block: 'end', behavior: 'instant' });
+                }
+                // Also drop a window scroll + every overflow container scroll,
+                // in case the page has a footer-style loader below the grid.
                 window.scrollTo(0, document.documentElement.scrollHeight);
                 for (const el of document.querySelectorAll('*')) {
                     if (!(el instanceof HTMLElement)) continue;
@@ -331,25 +348,25 @@ def _scroll_hard(page: Page, rounds: int = 60, pause_ms: int = 1500) -> None:
             """
         )
 
-        # 3. real mouse wheel near the bottom of the viewport
+        # 2. Real mouse wheel at the bottom of the viewport as extra nudge.
         try:
             vw = page.viewport_size or {"width": 1366, "height": 900}
             page.mouse.move(vw["width"] // 2, vw["height"] - 80)
-            for _ in range(6):
-                page.mouse.wheel(0, 3000)
-                page.wait_for_timeout(120)
+            for _ in range(4):
+                page.mouse.wheel(0, 2500)
+                page.wait_for_timeout(100)
         except Exception:
             pass
 
-        # 4. keyboard fallbacks
+        # 3. Keyboard fallbacks.
         try:
             page.keyboard.press("End")
-            page.wait_for_timeout(80)
+            page.wait_for_timeout(60)
             page.keyboard.press("PageDown")
         except Exception:
             pass
 
-        # 5. click any "Show more" / "Lihat lainnya" button
+        # 4. Click any "Show more" / "Lihat lainnya" button.
         try:
             page.evaluate(
                 """
@@ -381,13 +398,15 @@ def _scroll_hard(page: Page, rounds: int = 60, pause_ms: int = 1500) -> None:
         count = _count_listing_anchors(page)
         print(
             f"[+] Round {i + 1}: {count} listing anchors on page "
-            f"(stable {stable}/10)",
+            f"(stable {stable}/12)",
             file=sys.stderr,
         )
 
         if count == last:
             stable += 1
-            if stable >= 10:
+            # Need 12 stable rounds before giving up - API responses can
+            # be slow and we'd rather wait than truncate a big profile.
+            if stable >= 12:
                 break
         else:
             stable = 0
