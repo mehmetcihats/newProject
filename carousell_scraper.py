@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import os
 import re
 import sys
@@ -26,6 +27,9 @@ from typing import List, Set
 from urllib.parse import urlparse
 
 from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
+
+# Force stderr to be unbuffered so progress lines show up live in PowerShell.
+print = functools.partial(print, flush=True)  # noqa: A001
 
 
 BASE = "https://www.carousell.com"
@@ -108,45 +112,99 @@ def _click_load_more(page: Page) -> bool:
     return bool(clicked)
 
 
+def _scroll_all_containers(page: Page) -> None:
+    """
+    Scroll the window AND every scrollable child element to the bottom.
+
+    Some Carousell layouts nest the product grid inside a container whose own
+    overflow scrolls independently of the page, so scrolling only the window
+    won't trigger their lazy-loader.
+    """
+    page.evaluate(
+        """
+        () => {
+            // Scroll the window.
+            window.scrollTo(0, document.documentElement.scrollHeight);
+
+            // Scroll every scrollable descendant.
+            const all = document.querySelectorAll('*');
+            for (const el of all) {
+                if (!(el instanceof HTMLElement)) continue;
+                const style = getComputedStyle(el);
+                const canScroll =
+                    /(auto|scroll|overlay)/.test(style.overflowY) &&
+                    el.scrollHeight > el.clientHeight + 5;
+                if (canScroll) {
+                    el.scrollTop = el.scrollHeight;
+                }
+            }
+        }
+        """
+    )
+
+
 def auto_scroll(
     page: Page,
-    pause_ms: int = 2000,
+    pause_ms: int = 1500,
     max_rounds: int = 400,
-    stable_limit: int = 6,
-) -> None:
+    stable_limit: int = 8,
+) -> int:
     """
     Keep scrolling (and clicking 'show more' buttons) until the count of
     product listings stops growing for `stable_limit` rounds in a row.
 
-    We key off the number of listing anchors rather than page height,
-    because some Carousell layouts render a fixed-height container whose
-    scrollHeight barely changes as items stream in.
+    Uses multiple strategies in combination:
+      1. Scroll the window AND every scrollable child container.
+      2. Dispatch a real mouse-wheel event at the bottom of the viewport.
+      3. Press End / PageDown.
+      4. Click any 'Show more / Load more' button that appears.
+
+    Returns the final count of unique listing anchors found.
     """
     last_count = -1
     stable_rounds = 0
 
     for i in range(max_rounds):
-        # Nudge up a bit then jump to the bottom. The small upward scroll
-        # seems to help re-trigger Carousell's intersection-observer.
-        page.evaluate("() => window.scrollBy(0, -200)")
-        page.wait_for_timeout(150)
-        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        # --- scroll strategies combined ---
+        # 1. A small nudge up first (retriggers intersection observers).
+        page.evaluate("() => window.scrollBy(0, -300)")
+        page.wait_for_timeout(100)
 
-        # Try pressing End too, in case focus is inside a scrollable child.
+        # 2. Programmatic scroll on window + every scrollable container.
+        _scroll_all_containers(page)
+
+        # 3. Simulate a real mouse wheel near the bottom of the viewport.
+        try:
+            vw = page.viewport_size or {"width": 1366, "height": 900}
+            page.mouse.move(vw["width"] // 2, vw["height"] - 50)
+            # Several wheel ticks in a row, which looks more human.
+            for _ in range(5):
+                page.mouse.wheel(0, 2500)
+                page.wait_for_timeout(120)
+        except Exception:
+            pass
+
+        # 4. Keyboard fallbacks.
         try:
             page.keyboard.press("End")
+            page.wait_for_timeout(100)
+            page.keyboard.press("PageDown")
         except Exception:
             pass
 
         page.wait_for_timeout(pause_ms)
 
-        # If there's a 'Show more listings' button, click it.
+        # 5. If there's a 'Show more listings' button, click it.
         if _click_load_more(page):
             page.wait_for_timeout(pause_ms)
 
         count = _count_listings(page)
-        if count != last_count:
-            print(f"[+] Loaded {count} listings so far...", file=sys.stderr)
+        # Print a progress line every iteration so the user always sees life.
+        print(
+            f"[+] Round {i + 1}: {count} listings loaded "
+            f"(stable rounds: {stable_rounds}/{stable_limit})",
+            file=sys.stderr,
+        )
 
         if count == last_count:
             stable_rounds += 1
@@ -157,6 +215,7 @@ def auto_scroll(
             last_count = count
 
     page.evaluate("() => window.scrollTo(0, 0)")
+    return last_count if last_count >= 0 else 0
 
 
 def extract_products(page: Page) -> List[Product]:
@@ -291,7 +350,11 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
             )
 
         print("[+] Scrolling to load all listings...", file=sys.stderr)
-        auto_scroll(page)
+        total_loaded = auto_scroll(page)
+        print(
+            f"[+] Finished scrolling. {total_loaded} listing links on page.",
+            file=sys.stderr,
+        )
 
         print("[+] Extracting products...", file=sys.stderr)
         products = extract_products(page)
