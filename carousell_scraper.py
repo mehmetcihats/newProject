@@ -2,7 +2,7 @@
 Carousell user-profile scraper.
 
 Scrapes every product listing from a Carousell user's profile page
-(title, price, link) and writes the results to a CSV file.
+(title, price, link) and writes the results to both CSV and XLSX.
 
 Usage:
     python carousell_scraper.py <username-or-profile-url> [-o output.csv] [--headful]
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import sys
 import time
@@ -30,10 +31,13 @@ from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
 BASE = "https://www.carousell.com"
 
 # Any string that starts with a currency symbol / code followed by a number.
-# Covers S$, $, RM, HK$, US$, A$, NT$, ₱, ₩, ¥, €, £, IDR, SGD, MYR, PHP, etc.
+# Covers S$, $, RM, HK$, US$, A$, NT$, ₱, ₩, ¥, €, £, Rp, IDR, SGD, MYR, PHP, etc.
+# Case-insensitive so 'rp', 'Rp', 'RP' all match.
 PRICE_RE = re.compile(
-    r"(?:S\$|HK\$|US\$|A\$|NT\$|RM|IDR|SGD|MYR|PHP|HKD|USD|TWD|AUD|\$|₱|₩|¥|€|£)\s?"
-    r"[\d.,]+(?:\s?(?:k|K|million|M))?"
+    r"(?:Rp\.?|S\$|HK\$|US\$|A\$|NT\$|RM|IDR|SGD|MYR|PHP|HKD|USD|TWD|AUD|THB|VND|"
+    r"\$|₱|₩|¥|€|£|฿|₫)\s?"
+    r"[\d.,]+(?:\s?(?:k|K|juta|jt|rb|ribu|million|M))?",
+    re.IGNORECASE,
 )
 
 
@@ -48,53 +52,36 @@ def normalise_profile_url(arg: str) -> str:
     """Accept either a bare username or a full profile URL and return a full URL."""
     arg = arg.strip()
     if arg.startswith("http://") or arg.startswith("https://"):
-        # Ensure it points at /u/<username>/
         parsed = urlparse(arg)
         if "/u/" not in parsed.path:
             raise ValueError(
                 f"URL does not look like a Carousell user profile: {arg}"
             )
         return arg.rstrip("/") + "/"
-    # bare username
     return f"{BASE}/u/{arg.strip('/')}/"
 
 
 def auto_scroll(page: Page, pause_ms: int = 1500, max_rounds: int = 200) -> None:
-    """
-    Scroll to the bottom of the page repeatedly until the page height
-    stops growing (no more listings are being lazily loaded).
-    """
+    """Scroll to the bottom repeatedly until the page stops growing."""
     last_height = 0
     stable_rounds = 0
-    for i in range(max_rounds):
+    for _ in range(max_rounds):
         height = page.evaluate("() => document.body.scrollHeight")
         page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(pause_ms)
 
         if height == last_height:
             stable_rounds += 1
-            # Two stable rounds in a row = we've reached the end.
             if stable_rounds >= 2:
                 break
         else:
             stable_rounds = 0
             last_height = height
-    # Scroll back to top so lazy images finish rendering in the DOM (harmless).
     page.evaluate("() => window.scrollTo(0, 0)")
 
 
 def extract_products(page: Page) -> List[Product]:
-    """
-    Find every product listing card on the page and pull out title, price, link.
-
-    Strategy: product cards are <a> tags whose href contains '/p/<slug>-<id>'.
-    Within each card we look for lines of text; the line containing a currency
-    token is the price, and the first meaningful non-price line is the title.
-    """
-    # Grab a de-duplicated list of (href, innerText) tuples from the DOM.
-    # We walk up from each listing anchor to its card container so we can also
-    # detect "Sold" / "Reserved" badges, which are sibling elements rather
-    # than part of the anchor's own innerText.
+    """Find every product card and extract title, price, link."""
     raw = page.evaluate(
         """
         () => {
@@ -102,23 +89,23 @@ def extract_products(page: Page) -> List[Product]:
             const anchors = document.querySelectorAll('a[href*="/p/"]');
             anchors.forEach(a => {
                 const href = a.getAttribute('href') || '';
-                // Only listing-detail URLs look like /p/<slug>-<digits>
                 if (!/\\/p\\/[^/]+-\\d+/.test(href)) return;
 
                 const text = (a.innerText || '').trim();
                 if (!text) return;
 
-                // Walk up a few levels to find the whole product card so we
-                // can inspect its full text for Sold/Reserved overlays.
+                // Walk up to find the whole product card so we can also see
+                // Sold/Reserved overlays and the price (which may be a sibling
+                // of the anchor, not inside it).
                 let card = a;
-                for (let i = 0; i < 4 && card.parentElement; i++) {
+                for (let i = 0; i < 5 && card.parentElement; i++) {
                     card = card.parentElement;
                 }
                 const cardText = (card.innerText || '').trim();
 
                 const prev = seen.get(href);
                 const candidate = { text, cardText };
-                if (!prev || text.length > prev.text.length) {
+                if (!prev || cardText.length > prev.cardText.length) {
                     seen.set(href, candidate);
                 }
             });
@@ -133,8 +120,15 @@ def extract_products(page: Page) -> List[Product]:
     seen_links: Set[str] = set()
     skipped_sold = 0
 
-    # Status words that mean a listing is NOT available for sale.
-    UNAVAILABLE_STATUSES = ("sold", "reserved", "pending")
+    # Status words (English + Indonesian) that mean NOT available.
+    UNAVAILABLE_STATUSES = (
+        "sold", "reserved", "pending",
+        "terjual", "dipesan",  # Indonesian
+    )
+    BOILERPLATE = {
+        "protection", "carousell protection", "mailing", "meetup",
+        "bumped", "boosted", "promoted", "featured",
+    }
 
     for item in raw:
         href: str = item["href"]
@@ -146,34 +140,39 @@ def extract_products(page: Page) -> List[Product]:
             continue
         seen_links.add(link)
 
-        # Skip any listing whose card has a Sold / Reserved / Pending badge.
-        # We check word-boundaries so we don't filter titles that legitimately
-        # contain the substring (e.g. "Solid oak table").
         lowered = card_text.lower()
         if any(
-            re.search(rf"\b{status}\b", lowered) for status in UNAVAILABLE_STATUSES
+            re.search(rf"\b{re.escape(status)}\b", lowered)
+            for status in UNAVAILABLE_STATUSES
         ):
             skipped_sold += 1
             continue
 
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        # Pull price out of the whole card text (more reliable than anchor text;
+        # on many Carousell layouts the price sits outside the anchor).
         price = ""
+        price_match = PRICE_RE.search(card_text)
+        if price_match:
+            price = price_match.group(0).strip()
+
+        # Title: first non-price, non-boilerplate line from the anchor text.
         title = ""
-        for ln in lines:
-            m = PRICE_RE.search(ln)
-            if m and not price:
-                price = m.group(0).strip()
-            elif not title and not PRICE_RE.search(ln):
-                # First non-price line is the title.
-                # Skip obvious non-title boilerplate.
-                if ln.lower() in {"protection", "carousell protection", "mailing", "meetup", "bumped"}:
+        for ln in (l.strip() for l in text.splitlines() if l.strip()):
+            if PRICE_RE.search(ln):
+                continue
+            if ln.lower() in BOILERPLATE:
+                continue
+            title = ln
+            break
+
+        if not title:
+            # Fall back to first non-price line in the full card text.
+            for ln in (l.strip() for l in card_text.splitlines() if l.strip()):
+                if PRICE_RE.search(ln) or ln.lower() in BOILERPLATE:
                     continue
                 title = ln
+                break
 
-        if not title and lines:
-            title = lines[0]
-
-        # Skip rows that are clearly not products (e.g. empty text, only price).
         if not title and not price:
             continue
 
@@ -203,13 +202,12 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
         print(f"[+] Opening {profile_url}", file=sys.stderr)
         page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
 
-        # Give the SPA a moment to hydrate and render the first batch.
         try:
             page.wait_for_selector('a[href*="/p/"]', timeout=20_000)
         except PWTimeout:
             print(
                 "[!] No product links appeared within 20s. "
-                "The profile may be empty, private, or Carousell is blocking access.",
+                "The profile may be empty, private, or blocking access.",
                 file=sys.stderr,
             )
 
@@ -224,16 +222,55 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
 
 
 def write_csv(products: List[Product], path: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    """
+    Write a UTF-8 CSV with a BOM so that Excel (on any locale) opens it
+    with the correct encoding and separates it into real columns.
+    """
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=["title", "price", "link"])
         writer.writeheader()
         for p in products:
             writer.writerow(asdict(p))
 
 
+def write_xlsx(products: List[Product], path: str) -> bool:
+    """
+    Write a proper .xlsx spreadsheet with each field in its own column.
+    Returns False (and prints a hint) if openpyxl isn't installed.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError:
+        print(
+            "[i] Skipping .xlsx output (install openpyxl to enable: "
+            "'pip install openpyxl').",
+            file=sys.stderr,
+        )
+        return False
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Products"
+    ws.append(["title", "price", "link"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for p in products:
+        ws.append([p.title, p.price, p.link])
+
+    # Reasonable default column widths.
+    ws.column_dimensions["A"].width = 60
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 80
+
+    wb.save(path)
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Scrape a Carousell user's profile and export product listings to CSV.",
+        description="Scrape a Carousell user's profile and export listings to CSV + XLSX.",
     )
     parser.add_argument(
         "profile",
@@ -242,7 +279,8 @@ def main() -> int:
     parser.add_argument(
         "-o", "--output",
         default=None,
-        help="Output CSV file path. Defaults to '<username>_products.csv'.",
+        help="Output file path. Defaults to '<username>_products.csv'. "
+             "An .xlsx file with the same stem is also written.",
     )
     parser.add_argument(
         "--headful",
@@ -258,15 +296,20 @@ def main() -> int:
         return 2
 
     username = url.rstrip("/").split("/")[-1]
-    output = args.output or f"{username}_products.csv"
+    csv_path = args.output or f"{username}_products.csv"
+    stem, _ = os.path.splitext(csv_path)
+    xlsx_path = f"{stem}.xlsx"
 
     start = time.time()
     products = scrape_profile(url, headless=not args.headful)
     elapsed = time.time() - start
 
-    write_csv(products, output)
+    write_csv(products, csv_path)
+    wrote_xlsx = write_xlsx(products, xlsx_path)
+
+    outputs = csv_path + (f" + {xlsx_path}" if wrote_xlsx else "")
     print(
-        f"[+] Done. Scraped {len(products)} product(s) in {elapsed:.1f}s -> {output}",
+        f"[+] Done. Scraped {len(products)} product(s) in {elapsed:.1f}s -> {outputs}",
         file=sys.stderr,
     )
     return 0
