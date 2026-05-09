@@ -61,22 +61,101 @@ def normalise_profile_url(arg: str) -> str:
     return f"{BASE}/u/{arg.strip('/')}/"
 
 
-def auto_scroll(page: Page, pause_ms: int = 1500, max_rounds: int = 200) -> None:
-    """Scroll to the bottom repeatedly until the page stops growing."""
-    last_height = 0
+def _count_listings(page: Page) -> int:
+    """Count unique listing anchors currently rendered on the page."""
+    return page.evaluate(
+        """
+        () => {
+            const set = new Set();
+            document.querySelectorAll('a[href*="/p/"]').forEach(a => {
+                const h = a.getAttribute('href') || '';
+                if (/\\/p\\/[^/]+-\\d+/.test(h)) set.add(h);
+            });
+            return set.size;
+        }
+        """
+    )
+
+
+def _click_load_more(page: Page) -> bool:
+    """
+    Try to click a 'Show more listings' / 'Load more' button if one exists.
+    Returns True if a button was clicked.
+    """
+    clicked = page.evaluate(
+        """
+        () => {
+            const needles = [
+                'show more', 'load more', 'see more',
+                'lihat lainnya', 'lihat lebih banyak', 'muat lebih banyak',
+                'tampilkan lebih', 'mais',
+            ];
+            const els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+            for (const el of els) {
+                const t = (el.innerText || '').trim().toLowerCase();
+                if (!t) continue;
+                if (needles.some(n => t.includes(n))) {
+                    // Make sure it's visible on screen.
+                    el.scrollIntoView({ block: 'center' });
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """
+    )
+    return bool(clicked)
+
+
+def auto_scroll(
+    page: Page,
+    pause_ms: int = 2000,
+    max_rounds: int = 400,
+    stable_limit: int = 6,
+) -> None:
+    """
+    Keep scrolling (and clicking 'show more' buttons) until the count of
+    product listings stops growing for `stable_limit` rounds in a row.
+
+    We key off the number of listing anchors rather than page height,
+    because some Carousell layouts render a fixed-height container whose
+    scrollHeight barely changes as items stream in.
+    """
+    last_count = -1
     stable_rounds = 0
-    for _ in range(max_rounds):
-        height = page.evaluate("() => document.body.scrollHeight")
+
+    for i in range(max_rounds):
+        # Nudge up a bit then jump to the bottom. The small upward scroll
+        # seems to help re-trigger Carousell's intersection-observer.
+        page.evaluate("() => window.scrollBy(0, -200)")
+        page.wait_for_timeout(150)
         page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+
+        # Try pressing End too, in case focus is inside a scrollable child.
+        try:
+            page.keyboard.press("End")
+        except Exception:
+            pass
+
         page.wait_for_timeout(pause_ms)
 
-        if height == last_height:
+        # If there's a 'Show more listings' button, click it.
+        if _click_load_more(page):
+            page.wait_for_timeout(pause_ms)
+
+        count = _count_listings(page)
+        if count != last_count:
+            print(f"[+] Loaded {count} listings so far...", file=sys.stderr)
+
+        if count == last_count:
             stable_rounds += 1
-            if stable_rounds >= 2:
+            if stable_rounds >= stable_limit:
                 break
         else:
             stable_rounds = 0
-            last_height = height
+            last_count = count
+
     page.evaluate("() => window.scrollTo(0, 0)")
 
 
