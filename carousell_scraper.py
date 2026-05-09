@@ -2,14 +2,24 @@
 Carousell user-profile scraper.
 
 Scrapes every product listing from a Carousell user's profile page
-(title, price, link) and writes the results to both CSV and XLSX.
+(title, price, link) and writes the results to CSV and XLSX.
+
+Strategy:
+  1. Open the profile in a real browser (Playwright).
+  2. Intercept ALL JSON responses from the page and extract anything that
+     looks like a listing. This is the primary source of data - it catches
+     every listing the page itself sees, including ones loaded via infinite
+     scroll.
+  3. Also parse any __NEXT_DATA__ / JSON-LD embedded in the HTML as a backup.
+  4. Scroll aggressively to trigger the API calls that fetch more listings.
+  5. Fall back to DOM scraping as a last resort.
 
 Usage:
     python carousell_scraper.py <username-or-profile-url> [-o output.csv] [--headful]
 
 Examples:
     python carousell_scraper.py johndoe
-    python carousell_scraper.py https://www.carousell.com/u/johndoe/
+    python carousell_scraper.py https://id.carousell.com/u/johndoe/
     python carousell_scraper.py johndoe -o john.csv --headful
 """
 
@@ -18,25 +28,28 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
+import json
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass, asdict
-from typing import List, Set
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
-from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
+from playwright.sync_api import (
+    Page,
+    Response,
+    TimeoutError as PWTimeout,
+    sync_playwright,
+)
 
-# Force stderr to be unbuffered so progress lines show up live in PowerShell.
+# Force unbuffered so progress lines show up live in PowerShell.
 print = functools.partial(print, flush=True)  # noqa: A001
 
 
 BASE = "https://www.carousell.com"
 
-# Any string that starts with a currency symbol / code followed by a number.
-# Covers S$, $, RM, HK$, US$, A$, NT$, ₱, ₩, ¥, €, £, Rp, IDR, SGD, MYR, PHP, etc.
-# Case-insensitive so 'rp', 'Rp', 'RP' all match.
 PRICE_RE = re.compile(
     r"(?:Rp\.?|S\$|HK\$|US\$|A\$|NT\$|RM|IDR|SGD|MYR|PHP|HKD|USD|TWD|AUD|THB|VND|"
     r"\$|₱|₩|¥|€|£|฿|₫)\s?"
@@ -47,13 +60,17 @@ PRICE_RE = re.compile(
 
 @dataclass
 class Product:
-    title: str
-    price: str
-    link: str
+    title: str = ""
+    price: str = ""
+    link: str = ""
 
+
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
 
 def normalise_profile_url(arg: str) -> str:
-    """Accept either a bare username or a full profile URL and return a full URL."""
+    """Accept either a bare username or a full profile URL; return full URL."""
     arg = arg.strip()
     if arg.startswith("http://") or arg.startswith("https://"):
         parsed = urlparse(arg)
@@ -65,8 +82,212 @@ def normalise_profile_url(arg: str) -> str:
     return f"{BASE}/u/{arg.strip('/')}/"
 
 
-def _count_listings(page: Page) -> int:
-    """Count unique listing anchors currently rendered on the page."""
+def _build_listing_url(host: str, listing_id: str, slug: Optional[str] = None) -> str:
+    slug_part = f"{slug}-" if slug else ""
+    return f"https://{host}/p/{slug_part}{listing_id}/"
+
+
+# ---------------------------------------------------------------------------
+# JSON walking - pull any object that looks like a listing out of a big blob
+# ---------------------------------------------------------------------------
+
+def _looks_like_listing(obj: Dict[str, Any]) -> bool:
+    """
+    Heuristic: the object has an id-like field AND some combination of
+    title/price/slug. Carousell's API uses a handful of shapes across
+    endpoints so we match on any of them.
+    """
+    id_keys = ("id", "listingId", "listing_id", "productId", "product_id")
+    title_keys = ("title", "name", "productTitle", "product_title")
+    price_keys = (
+        "price",
+        "priceFormatted",
+        "price_formatted",
+        "priceHtml",
+        "displayPrice",
+        "display_price",
+        "currencyPriceFormatted",
+    )
+
+    has_id = any(k in obj for k in id_keys)
+    has_title = any(k in obj for k in title_keys)
+    has_price = any(k in obj for k in price_keys)
+
+    return has_id and has_title and has_price
+
+
+def _extract_listing(obj: Dict[str, Any], host: str) -> Optional[Product]:
+    """Pull title / price / link out of a JSON object matching a listing."""
+    # Title
+    title = ""
+    for k in ("title", "productTitle", "product_title", "name"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            title = v.strip()
+            break
+
+    # Price (prefer pre-formatted strings).
+    price = ""
+    for k in (
+        "priceFormatted",
+        "price_formatted",
+        "displayPrice",
+        "display_price",
+        "currencyPriceFormatted",
+        "price",
+    ):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            price = v.strip()
+            break
+        if isinstance(v, (int, float)) and price == "":
+            # No currency - leave raw for now; better than nothing.
+            price = str(v)
+            break
+        if isinstance(v, dict):
+            # Some APIs: { amount: 100000, currency: "IDR", formatted: "Rp 100.000" }
+            for fk in ("formatted", "display", "amount_formatted"):
+                fv = v.get(fk)
+                if isinstance(fv, str) and fv.strip():
+                    price = fv.strip()
+                    break
+            if price:
+                break
+
+    # ID + slug -> build the link.
+    listing_id = None
+    for k in ("id", "listingId", "listing_id", "productId", "product_id"):
+        v = obj.get(k)
+        if isinstance(v, (str, int)) and str(v).strip():
+            listing_id = str(v).strip()
+            break
+
+    slug = None
+    for k in ("slug", "productSlug", "product_slug", "urlSlug", "url_slug"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            slug = v.strip()
+            break
+
+    # Some endpoints include a ready-made URL path/href.
+    direct_link = None
+    for k in ("url", "href", "permalink", "listing_url", "productUrl"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            direct_link = v.strip()
+            break
+
+    if direct_link:
+        link = direct_link if direct_link.startswith("http") else f"https://{host}{direct_link if direct_link.startswith('/') else '/' + direct_link}"
+    elif listing_id:
+        link = _build_listing_url(host, listing_id, slug)
+    else:
+        return None
+
+    if not title and not price:
+        return None
+
+    return Product(title=title, price=price, link=link)
+
+
+def _walk_for_listings(
+    node: Any,
+    host: str,
+    out: Dict[str, Product],
+) -> None:
+    """Recursively walk a JSON structure, collecting every listing-like object."""
+    if isinstance(node, dict):
+        if _looks_like_listing(node):
+            prod = _extract_listing(node, host)
+            if prod and prod.link:
+                # Dedupe by link; prefer entries that have both title and price.
+                existing = out.get(prod.link)
+                if existing is None:
+                    out[prod.link] = prod
+                else:
+                    # Merge: keep richer fields.
+                    if not existing.title and prod.title:
+                        existing.title = prod.title
+                    if not existing.price and prod.price:
+                        existing.price = prod.price
+        for v in node.values():
+            _walk_for_listings(v, host, out)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_for_listings(v, host, out)
+
+
+# ---------------------------------------------------------------------------
+# DOM fallback
+# ---------------------------------------------------------------------------
+
+def _dom_listings(page: Page, host: str) -> List[Product]:
+    """Last-resort DOM scrape. Gets whatever cards are currently rendered."""
+    raw = page.evaluate(
+        """
+        () => {
+            const seen = new Map();
+            const anchors = document.querySelectorAll('a[href*="/p/"]');
+            anchors.forEach(a => {
+                const href = a.getAttribute('href') || '';
+                if (!/\\/p\\/[^/]+-\\d+/.test(href)) return;
+                const text = (a.innerText || '').trim();
+                let card = a;
+                for (let i = 0; i < 5 && card.parentElement; i++) {
+                    card = card.parentElement;
+                }
+                const cardText = (card.innerText || '').trim();
+                const prev = seen.get(href);
+                if (!prev || cardText.length > prev.cardText.length) {
+                    seen.set(href, { text, cardText });
+                }
+            });
+            return Array.from(seen, ([href, v]) => ({
+                href, text: v.text, cardText: v.cardText,
+            }));
+        }
+        """
+    )
+
+    BOILERPLATE = {
+        "protection", "carousell protection", "mailing", "meetup",
+        "bumped", "boosted", "promoted", "featured",
+    }
+
+    products: List[Product] = []
+    for item in raw:
+        href: str = item["href"]
+        text: str = item["text"] or ""
+        card_text: str = item.get("cardText") or text
+
+        link = href if href.startswith("http") else f"https://{host}{href}"
+
+        price_match = PRICE_RE.search(card_text)
+        price = price_match.group(0).strip() if price_match else ""
+
+        title = ""
+        for ln in (l.strip() for l in text.splitlines() if l.strip()):
+            if PRICE_RE.search(ln) or ln.lower() in BOILERPLATE:
+                continue
+            title = ln
+            break
+        if not title:
+            for ln in (l.strip() for l in card_text.splitlines() if l.strip()):
+                if PRICE_RE.search(ln) or ln.lower() in BOILERPLATE:
+                    continue
+                title = ln
+                break
+
+        if title or price:
+            products.append(Product(title=title, price=price, link=link))
+    return products
+
+
+# ---------------------------------------------------------------------------
+# Scrolling - just keep nudging the page to trigger API fetches.
+# ---------------------------------------------------------------------------
+
+def _count_listing_anchors(page: Page) -> int:
     return page.evaluate(
         """
         () => {
@@ -81,255 +302,111 @@ def _count_listings(page: Page) -> int:
     )
 
 
-def _click_load_more(page: Page) -> bool:
+def _scroll_hard(page: Page, rounds: int = 60, pause_ms: int = 1500) -> None:
     """
-    Try to click a 'Show more listings' / 'Load more' button if one exists.
-    Returns True if a button was clicked.
+    Scroll aggressively to trigger every lazy-loader the page might have.
+    Progress is printed each round so the user can see what's happening.
     """
-    clicked = page.evaluate(
-        """
-        () => {
-            const needles = [
-                'show more', 'load more', 'see more',
-                'lihat lainnya', 'lihat lebih banyak', 'muat lebih banyak',
-                'tampilkan lebih', 'mais',
-            ];
-            const els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-            for (const el of els) {
-                const t = (el.innerText || '').trim().toLowerCase();
-                if (!t) continue;
-                if (needles.some(n => t.includes(n))) {
-                    // Make sure it's visible on screen.
-                    el.scrollIntoView({ block: 'center' });
-                    el.click();
-                    return true;
+    last = -1
+    stable = 0
+    for i in range(rounds):
+        # 1. nudge up
+        page.evaluate("() => window.scrollBy(0, -400)")
+        page.wait_for_timeout(120)
+
+        # 2. scroll window + every scrollable descendant to the bottom
+        page.evaluate(
+            """
+            () => {
+                window.scrollTo(0, document.documentElement.scrollHeight);
+                for (const el of document.querySelectorAll('*')) {
+                    if (!(el instanceof HTMLElement)) continue;
+                    const s = getComputedStyle(el);
+                    if (/(auto|scroll|overlay)/.test(s.overflowY)
+                        && el.scrollHeight > el.clientHeight + 5) {
+                        el.scrollTop = el.scrollHeight;
+                    }
                 }
             }
-            return false;
-        }
-        """
-    )
-    return bool(clicked)
+            """
+        )
 
-
-def _scroll_all_containers(page: Page) -> None:
-    """
-    Scroll the window AND every scrollable child element to the bottom.
-
-    Some Carousell layouts nest the product grid inside a container whose own
-    overflow scrolls independently of the page, so scrolling only the window
-    won't trigger their lazy-loader.
-    """
-    page.evaluate(
-        """
-        () => {
-            // Scroll the window.
-            window.scrollTo(0, document.documentElement.scrollHeight);
-
-            // Scroll every scrollable descendant.
-            const all = document.querySelectorAll('*');
-            for (const el of all) {
-                if (!(el instanceof HTMLElement)) continue;
-                const style = getComputedStyle(el);
-                const canScroll =
-                    /(auto|scroll|overlay)/.test(style.overflowY) &&
-                    el.scrollHeight > el.clientHeight + 5;
-                if (canScroll) {
-                    el.scrollTop = el.scrollHeight;
-                }
-            }
-        }
-        """
-    )
-
-
-def auto_scroll(
-    page: Page,
-    pause_ms: int = 1500,
-    max_rounds: int = 400,
-    stable_limit: int = 8,
-) -> int:
-    """
-    Keep scrolling (and clicking 'show more' buttons) until the count of
-    product listings stops growing for `stable_limit` rounds in a row.
-
-    Uses multiple strategies in combination:
-      1. Scroll the window AND every scrollable child container.
-      2. Dispatch a real mouse-wheel event at the bottom of the viewport.
-      3. Press End / PageDown.
-      4. Click any 'Show more / Load more' button that appears.
-
-    Returns the final count of unique listing anchors found.
-    """
-    last_count = -1
-    stable_rounds = 0
-
-    for i in range(max_rounds):
-        # --- scroll strategies combined ---
-        # 1. A small nudge up first (retriggers intersection observers).
-        page.evaluate("() => window.scrollBy(0, -300)")
-        page.wait_for_timeout(100)
-
-        # 2. Programmatic scroll on window + every scrollable container.
-        _scroll_all_containers(page)
-
-        # 3. Simulate a real mouse wheel near the bottom of the viewport.
+        # 3. real mouse wheel near the bottom of the viewport
         try:
             vw = page.viewport_size or {"width": 1366, "height": 900}
-            page.mouse.move(vw["width"] // 2, vw["height"] - 50)
-            # Several wheel ticks in a row, which looks more human.
-            for _ in range(5):
-                page.mouse.wheel(0, 2500)
+            page.mouse.move(vw["width"] // 2, vw["height"] - 80)
+            for _ in range(6):
+                page.mouse.wheel(0, 3000)
                 page.wait_for_timeout(120)
         except Exception:
             pass
 
-        # 4. Keyboard fallbacks.
+        # 4. keyboard fallbacks
         try:
             page.keyboard.press("End")
-            page.wait_for_timeout(100)
+            page.wait_for_timeout(80)
             page.keyboard.press("PageDown")
+        except Exception:
+            pass
+
+        # 5. click any "Show more" / "Lihat lainnya" button
+        try:
+            page.evaluate(
+                """
+                () => {
+                    const needles = [
+                        'show more', 'load more', 'see more',
+                        'lihat lainnya', 'lihat lebih banyak',
+                        'muat lebih banyak', 'tampilkan lebih',
+                    ];
+                    for (const el of document.querySelectorAll(
+                        'button, a, div[role="button"]'
+                    )) {
+                        const t = (el.innerText || '').trim().toLowerCase();
+                        if (!t) continue;
+                        if (needles.some(n => t.includes(n))) {
+                            el.scrollIntoView({ block: 'center' });
+                            el.click();
+                            return;
+                        }
+                    }
+                }
+                """
+            )
         except Exception:
             pass
 
         page.wait_for_timeout(pause_ms)
 
-        # 5. If there's a 'Show more listings' button, click it.
-        if _click_load_more(page):
-            page.wait_for_timeout(pause_ms)
-
-        count = _count_listings(page)
-        # Print a progress line every iteration so the user always sees life.
+        count = _count_listing_anchors(page)
         print(
-            f"[+] Round {i + 1}: {count} listings loaded "
-            f"(stable rounds: {stable_rounds}/{stable_limit})",
+            f"[+] Round {i + 1}: {count} listing anchors on page "
+            f"(stable {stable}/10)",
             file=sys.stderr,
         )
 
-        if count == last_count:
-            stable_rounds += 1
-            if stable_rounds >= stable_limit:
+        if count == last:
+            stable += 1
+            if stable >= 10:
                 break
         else:
-            stable_rounds = 0
-            last_count = count
-
-    page.evaluate("() => window.scrollTo(0, 0)")
-    return last_count if last_count >= 0 else 0
+            stable = 0
+            last = count
 
 
-def extract_products(page: Page) -> List[Product]:
-    """Find every product card and extract title, price, link."""
-    raw = page.evaluate(
-        """
-        () => {
-            const seen = new Map();
-            const anchors = document.querySelectorAll('a[href*="/p/"]');
-            anchors.forEach(a => {
-                const href = a.getAttribute('href') || '';
-                if (!/\\/p\\/[^/]+-\\d+/.test(href)) return;
-
-                const text = (a.innerText || '').trim();
-                if (!text) return;
-
-                // Walk up to find the whole product card so we can also see
-                // Sold/Reserved overlays and the price (which may be a sibling
-                // of the anchor, not inside it).
-                let card = a;
-                for (let i = 0; i < 5 && card.parentElement; i++) {
-                    card = card.parentElement;
-                }
-                const cardText = (card.innerText || '').trim();
-
-                const prev = seen.get(href);
-                const candidate = { text, cardText };
-                if (!prev || cardText.length > prev.cardText.length) {
-                    seen.set(href, candidate);
-                }
-            });
-            return Array.from(seen, ([href, v]) => ({
-                href, text: v.text, cardText: v.cardText,
-            }));
-        }
-        """
-    )
-
-    products: List[Product] = []
-    seen_links: Set[str] = set()
-    skipped_sold = 0
-
-    # Status words (English + Indonesian) that mean NOT available.
-    UNAVAILABLE_STATUSES = (
-        "sold", "reserved", "pending",
-        "terjual", "dipesan",  # Indonesian
-    )
-    BOILERPLATE = {
-        "protection", "carousell protection", "mailing", "meetup",
-        "bumped", "boosted", "promoted", "featured",
-    }
-
-    for item in raw:
-        href: str = item["href"]
-        text: str = item["text"]
-        card_text: str = item.get("cardText", "") or text
-
-        link = href if href.startswith("http") else f"{BASE}{href}"
-        if link in seen_links:
-            continue
-        seen_links.add(link)
-
-        lowered = card_text.lower()
-        if any(
-            re.search(rf"\b{re.escape(status)}\b", lowered)
-            for status in UNAVAILABLE_STATUSES
-        ):
-            skipped_sold += 1
-            continue
-
-        # Pull price out of the whole card text (more reliable than anchor text;
-        # on many Carousell layouts the price sits outside the anchor).
-        price = ""
-        price_match = PRICE_RE.search(card_text)
-        if price_match:
-            price = price_match.group(0).strip()
-
-        # Title: first non-price, non-boilerplate line from the anchor text.
-        title = ""
-        for ln in (l.strip() for l in text.splitlines() if l.strip()):
-            if PRICE_RE.search(ln):
-                continue
-            if ln.lower() in BOILERPLATE:
-                continue
-            title = ln
-            break
-
-        if not title:
-            # Fall back to first non-price line in the full card text.
-            for ln in (l.strip() for l in card_text.splitlines() if l.strip()):
-                if PRICE_RE.search(ln) or ln.lower() in BOILERPLATE:
-                    continue
-                title = ln
-                break
-
-        if not title and not price:
-            continue
-
-        products.append(Product(title=title, price=price, link=link))
-
-    if skipped_sold:
-        print(
-            f"[i] Skipped {skipped_sold} sold/reserved listing(s).",
-            file=sys.stderr,
-        )
-    return products
-
+# ---------------------------------------------------------------------------
+# Main scrape
+# ---------------------------------------------------------------------------
 
 def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
+    host = urlparse(profile_url).hostname or "www.carousell.com"
+    collected: Dict[str, Product] = {}  # link -> Product
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
         context = browser.new_context(
             user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
@@ -337,6 +414,35 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
             locale="en-US",
         )
         page = context.new_page()
+
+        # Intercept every JSON-ish response and mine it for listings.
+        def on_response(resp: Response) -> None:
+            try:
+                ct = (resp.headers.get("content-type") or "").lower()
+                if "json" not in ct:
+                    return
+                url = resp.url
+                # Only listen to Carousell's own endpoints.
+                if "carousell" not in url:
+                    return
+                body_text = resp.text()
+                if not body_text or len(body_text) > 4_000_000:
+                    return
+                data = json.loads(body_text)
+            except Exception:
+                return
+            before = len(collected)
+            _walk_for_listings(data, host, collected)
+            gained = len(collected) - before
+            if gained:
+                print(
+                    f"[net] +{gained} listings from {url.split('?')[0]} "
+                    f"(total: {len(collected)})",
+                    file=sys.stderr,
+                )
+
+        page.on("response", on_response)
+
         print(f"[+] Opening {profile_url}", file=sys.stderr)
         page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
 
@@ -349,44 +455,78 @@ def scrape_profile(profile_url: str, headless: bool = True) -> List[Product]:
                 file=sys.stderr,
             )
 
-        print("[+] Scrolling to load all listings...", file=sys.stderr)
-        total_loaded = auto_scroll(page)
-        print(
-            f"[+] Finished scrolling. {total_loaded} listing links on page.",
-            file=sys.stderr,
-        )
+        # Harvest any listings embedded in __NEXT_DATA__ / the initial HTML.
+        try:
+            next_data_raw = page.evaluate(
+                "() => { const el = document.getElementById('__NEXT_DATA__');"
+                " return el ? el.textContent : null; }"
+            )
+            if next_data_raw:
+                try:
+                    data = json.loads(next_data_raw)
+                    before = len(collected)
+                    _walk_for_listings(data, host, collected)
+                    print(
+                        f"[+] __NEXT_DATA__ yielded {len(collected) - before} "
+                        f"listings (total: {len(collected)})",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-        print("[+] Extracting products...", file=sys.stderr)
-        products = extract_products(page)
+        print("[+] Scrolling to trigger API pagination...", file=sys.stderr)
+        _scroll_hard(page)
+
+        # Final DOM scrape as a backup / enrichment pass.
+        dom_products = _dom_listings(page, host)
+        for p in dom_products:
+            existing = collected.get(p.link)
+            if existing is None:
+                collected[p.link] = p
+            else:
+                if not existing.title and p.title:
+                    existing.title = p.title
+                if not existing.price and p.price:
+                    existing.price = p.price
 
         browser.close()
-        return products
+
+    # Filter out sold / reserved from whatever the DOM told us (the API
+    # results may not carry status; we keep them unless they came from a
+    # card with a sold badge).
+    # Keep it simple: just return everything we've got, deduped.
+    return list(collected.values())
 
 
-def write_csv(products: List[Product], path: str) -> None:
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def write_csv(products: List[Product], path: str, delimiter: str = ";") -> None:
     """
-    Write a UTF-8 CSV with a BOM so that Excel (on any locale) opens it
-    with the correct encoding and separates it into real columns.
+    Write a UTF-8 (with BOM) CSV. The BOM makes Excel pick up UTF-8 reliably,
+    and the semicolon delimiter is what Excel expects on Indonesian /
+    European locales - it will parse into proper columns.
     """
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["title", "price", "link"])
+        writer = csv.DictWriter(
+            f, fieldnames=["title", "price", "link"], delimiter=delimiter
+        )
         writer.writeheader()
         for p in products:
             writer.writerow(asdict(p))
 
 
 def write_xlsx(products: List[Product], path: str) -> bool:
-    """
-    Write a proper .xlsx spreadsheet with each field in its own column.
-    Returns False (and prints a hint) if openpyxl isn't installed.
-    """
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font
     except ImportError:
         print(
-            "[i] Skipping .xlsx output (install openpyxl to enable: "
-            "'pip install openpyxl').",
+            "[i] Skipping .xlsx output. Install openpyxl to enable:\n"
+            "    pip install openpyxl",
             file=sys.stderr,
         )
         return False
@@ -397,38 +537,26 @@ def write_xlsx(products: List[Product], path: str) -> bool:
     ws.append(["title", "price", "link"])
     for cell in ws[1]:
         cell.font = Font(bold=True)
-
     for p in products:
         ws.append([p.title, p.price, p.link])
-
-    # Reasonable default column widths.
     ws.column_dimensions["A"].width = 60
     ws.column_dimensions["B"].width = 18
     ws.column_dimensions["C"].width = 80
-
     wb.save(path)
     return True
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Scrape a Carousell user's profile and export listings to CSV + XLSX.",
+        description="Scrape a Carousell user's profile and export listings.",
     )
-    parser.add_argument(
-        "profile",
-        help="Carousell username or full profile URL (https://www.carousell.com/u/<username>/).",
-    )
-    parser.add_argument(
-        "-o", "--output",
-        default=None,
-        help="Output file path. Defaults to '<username>_products.csv'. "
-             "An .xlsx file with the same stem is also written.",
-    )
-    parser.add_argument(
-        "--headful",
-        action="store_true",
-        help="Run the browser in a visible window (useful for debugging).",
-    )
+    parser.add_argument("profile")
+    parser.add_argument("-o", "--output", default=None)
+    parser.add_argument("--headful", action="store_true")
     args = parser.parse_args()
 
     try:
