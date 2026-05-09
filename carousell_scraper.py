@@ -747,7 +747,20 @@ def main() -> int:
         description="Scrape a Carousell user's profile and export listings.",
     )
     parser.add_argument("profile")
-    parser.add_argument("-o", "--output", default=None)
+    parser.add_argument(
+        "-o", "--output", default=None,
+        help=(
+            "Exact output path (e.g. myfile.csv). If omitted, each run writes"
+            " a new timestamped file so nothing gets overwritten."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help=(
+            "Use the plain '<username>_products.csv' filename (no timestamp)."
+            " Each run will overwrite the previous one."
+        ),
+    )
     parser.add_argument("--headful", action="store_true")
     args = parser.parse_args()
 
@@ -758,7 +771,17 @@ def main() -> int:
         return 2
 
     username = url.rstrip("/").split("/")[-1]
-    csv_path = args.output or f"{username}_products.csv"
+
+    if args.output:
+        csv_path = args.output
+    elif args.overwrite:
+        csv_path = f"{username}_products.csv"
+    else:
+        # Default: timestamp the filename so every run creates a new file
+        # and previous scrapes are kept.
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        csv_path = f"{username}_products_{stamp}.csv"
+
     stem, _ = os.path.splitext(csv_path)
     xlsx_path = f"{stem}.xlsx"
 
